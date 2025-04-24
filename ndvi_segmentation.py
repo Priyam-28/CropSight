@@ -7,6 +7,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import folium
 from sklearn.cluster import KMeans, DBSCAN
+from sklearn.mixture import GaussianMixture
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.colors import LinearSegmentedColormap
@@ -29,6 +30,29 @@ def initialize_ee():
 # Call the initialization function
 initialize_ee()
 
+def get_rainfall_data(start_date, end_date, geometry):
+    """Fetch precipitation data from CHIRPS dataset."""
+    # Format dates for Earth Engine
+    start = ee.Date(start_date.strftime('%Y-%m-%d'))
+    end = ee.Date(end_date.strftime('%Y-%m-%d'))
+    
+    # Get CHIRPS precipitation data (daily rainfall in mm)
+    rainfall = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY') \
+        .filterDate(start, end) \
+        .filterBounds(geometry)
+    
+    # Calculate total and average rainfall
+    total_rainfall = rainfall.sum().select('precipitation')
+    avg_rainfall = rainfall.mean().select('precipitation')
+    
+    # Get time series for plotting
+    rainfall_series = extract_rainfall_time_series(rainfall, geometry)
+    
+    return {
+        'total': total_rainfall,
+        'average': avg_rainfall,
+        'time_series': rainfall_series
+    }
 def app():
     st.title("Field Segmentation using NDVI Analysis")
     st.write("Analyze agricultural fields using satellite imagery and NDVI values")
@@ -51,16 +75,19 @@ def app():
         # Clustering method selection
         clustering_method = st.selectbox(
             "Clustering Method", 
-            ["K-Means", "DBSCAN"]
+            ["K-Means", "DBSCAN","Mean Shift", "GMM"]
         )
         
-        if clustering_method == "K-Means":
+        if clustering_method == "K-Means" or clustering_method == "GMM":
             num_zones = st.slider("Number of Zones", min_value=2, max_value=7, value=3)
+        elif clustering_method == "Mean Shift":
+            bandwidth = st.slider("Bandwidth (Controls cluster size)", 
+                                min_value=0.01, max_value=0.2, value=0.1, step=0.01)
         else:  # DBSCAN
             eps_value = st.slider("DBSCAN Epsilon (Distance Threshold)", 
-                               min_value=0.01, max_value=0.2, value=0.05, step=0.01)
+                        min_value=0.01, max_value=0.2, value=0.05, step=0.01)
             min_samples = st.slider("DBSCAN Min Samples", 
-                                min_value=5, max_value=50, value=10, step=5)
+                        min_value=5, max_value=50, value=10, step=5)
     
     with col3:
         st.subheader("Crop Information")
@@ -78,8 +105,8 @@ def app():
     
     # Analysis button
     if st.button("Analyze Field"):
-        with st.spinner("Processing satellite imagery..."):
-            # Get Sentinel-2 imagery
+         with st.spinner("Processing satellite imagery..."):
+        # Get Sentinel-2 imagery
             s2_collection = get_sentinel2_collection(start_date, end_date, ee.Geometry.Point([longitude, latitude]).buffer(buffer_size))
             
             # Calculate NDVI for the collection
@@ -94,13 +121,39 @@ def app():
             # Perform field boundary if provided or use buffer
             field = ee.Geometry.Point([longitude, latitude]).buffer(buffer_size)
             
+            # Get rainfall data
+            rainfall_data = get_rainfall_data(start_date, end_date, ee.Geometry.Point([longitude, latitude]).buffer(buffer_size))
+            # Performance metrics
+            performance_metrics = {}
+            
             # Perform zoning using selected clustering method
+            # In the "Analyze Field" button logic
             if clustering_method == "K-Means":
+                start_time = datetime.now()
                 zoned_image = perform_kmeans_zoning(median_ndvi, field, num_zones)
+                end_time = datetime.now()
+                processing_time = (end_time - start_time).total_seconds()
                 zones_param = num_zones  # For reporting
+                performance_metrics["K-Means"] = processing_time
+                
+            elif clustering_method == "GMM":
+                zoned_image, processing_time = perform_gmm_zoning(median_ndvi, field, num_zones)
+                zones_param = num_zones  # For reporting
+                performance_metrics["GMM"] = processing_time
+                
+            elif clustering_method == "Mean Shift":
+                zoned_image, num_clusters, processing_time = perform_meanshift_zoning(median_ndvi, field, bandwidth)
+                zones_param = num_clusters  # For reporting
+                performance_metrics["Mean Shift"] = processing_time
+                st.success(f"Mean Shift identified {num_clusters} zones")
+                
             else:  # DBSCAN
+                start_time = datetime.now()
                 zoned_image, actual_zones = perform_dbscan_zoning(median_ndvi, field, eps_value, min_samples)
-                zones_param = f"eps={eps_value}, min_samples={min_samples}"  # For reporting
+                end_time = datetime.now()
+                processing_time = (end_time - start_time).total_seconds()
+                zones_param = actual_zones  # For reporting
+                performance_metrics["DBSCAN"] = processing_time
             
             # Display results
             display_results(
@@ -110,9 +163,11 @@ def app():
                 latitude, 
                 longitude, 
                 clustering_method,
-                zones_param if clustering_method == "K-Means" else actual_zones,
+                zones_param,
                 ndvi_time_series,
-                crop_type
+                crop_type,
+                performance_metrics,
+                rainfall_data
             )
             
             # Export option
@@ -127,7 +182,8 @@ def app():
                     clustering_method,
                     zones_param,
                     crop_type,
-                    crop_growth_stage
+                    crop_growth_stage,
+                    rainfall_data
                 ),
                 file_name="field_analysis_report.txt",
                 mime="text/plain"
@@ -157,13 +213,16 @@ def calculate_ndvi(image_collection):
     return image_collection.map(add_ndvi)
 
 def extract_ndvi_time_series(ndvi_collection, geometry):
-    """Extract NDVI time series data for plotting."""
+    """Extract NDVI time series data for plotting and storage."""
     # Get dates of images in collection
     image_list = ndvi_collection.toList(ndvi_collection.size())
     size = image_list.size().getInfo()
     
     dates = []
     mean_ndvi_values = []
+    
+    # Create storage for day-wise NDVI values
+    ndvi_daily_data = {}
     
     for i in range(size):
         image = ee.Image(image_list.get(i))
@@ -181,8 +240,139 @@ def extract_ndvi_time_series(ndvi_collection, geometry):
         if mean_ndvi is not None:
             dates.append(date_str)
             mean_ndvi_values.append(mean_ndvi)
+            
+            # Store the daily NDVI image for this date
+            ndvi_daily_data[date_str] = {
+                'mean': mean_ndvi,
+                'image': image.select('NDVI')
+            }
+    
+    # Store the daily NDVI data in the session state
+    st.session_state['ndvi_daily_data'] = ndvi_daily_data
     
     return pd.DataFrame({'date': dates, 'ndvi': mean_ndvi_values})
+
+def extract_rainfall_time_series(rainfall_collection, geometry):
+    """Extract rainfall time series data for plotting."""
+    # Get dates of images in collection
+    image_list = rainfall_collection.toList(rainfall_collection.size())
+    size = image_list.size().getInfo()
+    
+    dates = []
+    rainfall_values = []
+    
+    for i in range(size):
+        image = ee.Image(image_list.get(i))
+        date = image.date()
+        date_str = date.format('YYYY-MM-dd').getInfo()
+        
+        # Calculate mean rainfall for the field area
+        mean_rainfall = image.select('precipitation').reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=geometry,
+            scale=5000,  # CHIRPS data is coarse resolution
+            maxPixels=1e9
+        ).get('precipitation').getInfo()
+        
+        # Only add valid readings
+        if mean_rainfall is not None:
+            dates.append(date_str)
+            rainfall_values.append(mean_rainfall)
+    
+    return pd.DataFrame({'date': dates, 'rainfall': rainfall_values})
+
+def perform_meanshift_zoning(ndvi_image, geometry, bandwidth=0.1):
+    """Segment the field into zones based on NDVI values using Mean Shift clustering."""
+    try:
+        # Sample NDVI values within the field boundary with a smaller sample size
+        ndvi_sample = ndvi_image.select('NDVI').sampleRegions(
+            collection=geometry,
+            scale=10,  # 10m scale
+            geometries=True,
+            tileScale=16  # Add tileScale to help with computation
+        )
+        
+        # Try to get the sample data with a timeout
+        try:
+            sample_data = ndvi_sample.getInfo()
+        except Exception as e:
+            st.error(f"Error getting NDVI samples: {str(e)}")
+            st.warning("Falling back to K-Means clustering with 3 zones due to sampling error.")
+            return perform_kmeans_zoning(ndvi_image, geometry, 3), 3, 0.0
+        
+        # Check if we have enough sample data
+        if 'features' not in sample_data or len(sample_data['features']) < 10:
+            st.warning("Not enough NDVI sample points found. Using K-Means with 3 clusters instead.")
+            return perform_kmeans_zoning(ndvi_image, geometry, 3), 3, 0.0
+        
+        # Extract NDVI values
+        ndvi_values = []
+        for feature in sample_data['features']:
+            if 'NDVI' in feature['properties'] and feature['properties']['NDVI'] is not None:
+                ndvi_values.append([feature['properties']['NDVI']])
+        
+        # Check if we have enough valid NDVI values
+        if len(ndvi_values) < 10:
+            st.warning("Not enough valid NDVI values found. Using K-Means with 3 clusters instead.")
+            return perform_kmeans_zoning(ndvi_image, geometry, 3), 3, 0.0
+        
+        # Apply Mean Shift clustering
+        ndvi_array = np.array(ndvi_values)
+        
+        # Start time for performance measurement
+        start_time = datetime.now()
+        
+        # Import MeanShift
+        from sklearn.cluster import MeanShift
+        
+        # Apply MeanShift clustering
+        meanshift = MeanShift(bandwidth=bandwidth, bin_seeding=True)
+        clusters = meanshift.fit_predict(ndvi_array)
+        
+        # End time for performance measurement
+        end_time = datetime.now()
+        processing_time = (end_time - start_time).total_seconds()
+        
+        # Number of clusters found
+        num_clusters = len(np.unique(clusters))
+        
+        # If Mean Shift found only one cluster, adjust bandwidth
+        if num_clusters <= 1:
+            st.warning("Mean Shift identified only one cluster. Adjusting parameters and trying again.")
+            # Try with smaller bandwidth
+            meanshift = MeanShift(bandwidth=bandwidth/2, bin_seeding=True)
+            clusters = meanshift.fit_predict(ndvi_array)
+            num_clusters = len(np.unique(clusters))
+            
+            if num_clusters <= 1:
+                st.warning("Mean Shift still found only one cluster. Using KMeans with 3 clusters instead.")
+                return perform_kmeans_zoning(ndvi_image, geometry, 3), 3, processing_time
+        
+        # Create a list with [ndvi_value, cluster_label]
+        labeled_data = []
+        for i, ndvi_val in enumerate(ndvi_values):
+            labeled_data.append([ndvi_val[0], int(clusters[i])])
+        
+        # Sort by NDVI value to assign sensible zone numbers (higher NDVI = higher zone number)
+        labeled_data.sort(key=lambda x: x[0])
+        
+        # Create mapping from cluster labels to ordered zone numbers
+        unique_clusters = sorted(list(set([x[1] for x in labeled_data])))
+        cluster_to_zone = {cluster: i for i, cluster in enumerate(unique_clusters)}
+        
+        # Apply mapping to get ordered zone numbers
+        for i in range(len(labeled_data)):
+            labeled_data[i][1] = cluster_to_zone[labeled_data[i][1]]
+        
+        # Similar to DBSCAN implementation, use K-Means as a base for visualization
+        kmeans_result = perform_kmeans_zoning(ndvi_image, geometry, len(unique_clusters))
+        
+        return kmeans_result, num_clusters, processing_time
+        
+    except Exception as e:
+        st.error(f"Error in Mean Shift clustering: {str(e)}")
+        st.warning("Falling back to K-Means clustering with 3 zones.")
+        return perform_kmeans_zoning(ndvi_image, geometry, 3), 3, 0.0
 
 def perform_kmeans_zoning(ndvi_image, geometry, num_zones):
     """Segment the field into zones based on NDVI values using K-means clustering."""
@@ -266,11 +456,61 @@ def perform_dbscan_zoning(ndvi_image, geometry, eps, min_samples):
     # This is a limitation as we can't easily convert our Python DBSCAN results back to EE
     
     return kmeans_result, num_clusters
+def perform_gmm_zoning(ndvi_image, geometry, num_zones):
+    """Segment the field into zones based on NDVI values using Gaussian Mixture Model."""
+    # Sample NDVI values within the field boundary
+    ndvi_sample = ndvi_image.select('NDVI').sampleRegions(
+        collection=geometry,
+        scale=10,
+        geometries=True
+    )
+    
+    # Convert Earth Engine FeatureCollection to a Python list
+    sample_data = ndvi_sample.getInfo()
+    
+    # Extract NDVI values
+    ndvi_values = []
+    for feature in sample_data['features']:
+        ndvi_values.append([feature['properties']['NDVI']])
+    
+    # Apply GMM clustering
+    ndvi_array = np.array(ndvi_values)
+    
+    # Start time for performance measurement
+    start_time = datetime.now()
+    
+    gmm = GaussianMixture(n_components=num_zones, random_state=42)
+    clusters = gmm.fit_predict(ndvi_array)
+    
+    # End time for performance measurement
+    end_time = datetime.now()
+    processing_time = (end_time - start_time).total_seconds()
+    
+    # Create a list with [ndvi_value, cluster_label]
+    labeled_data = []
+    for i, ndvi_val in enumerate(ndvi_values):
+        labeled_data.append([ndvi_val[0], int(clusters[i])])
+    
+    # Sort by NDVI value to assign sensible zone numbers (higher NDVI = higher zone number)
+    labeled_data.sort(key=lambda x: x[0])
+    
+    # Create mapping from cluster labels to ordered zone numbers
+    unique_clusters = sorted(list(set([x[1] for x in labeled_data])))
+    cluster_to_zone = {cluster: i for i, cluster in enumerate(unique_clusters)}
+    
+    # Apply mapping to get ordered zone numbers
+    for i in range(len(labeled_data)):
+        labeled_data[i][1] = cluster_to_zone[labeled_data[i][1]]
+    
+    # Similar to DBSCAN implementation, use K-Means as a base for visualization
+    kmeans_result = perform_kmeans_zoning(ndvi_image, geometry, len(unique_clusters))
+    
+    return kmeans_result, processing_time
 
-def display_results(ndvi_image, zoned_image, geometry, lat, lon, clustering_method, zones_param, ndvi_time_series, crop_type):
+def display_results(ndvi_image, zoned_image, geometry, lat, lon, clustering_method, zones_param, ndvi_time_series, crop_type, performance_metrics=None, rainfall_data=None):
     """Display the results on the Streamlit app."""
     # Create tabs for different visualizations
-    tab1, tab2, tab3, tab4 = st.tabs(["NDVI Map", "Field Zones", "Time Series", "Analysis"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["NDVI Map", "Field Zones", "NDVI Time Series", "Rainfall", "Analysis", "Algorithm Comparison"])
     
     with tab1:
         st.subheader("NDVI Distribution")
@@ -409,18 +649,133 @@ def display_results(ndvi_image, zoned_image, geometry, lat, lon, clustering_meth
                 except Exception as e:
                     st.error(f"Could not calculate trend: {str(e)}")
             
-            # Download time series data
-            csv = ndvi_time_series.to_csv(index=False)
+            # Display daily NDVI data
+            st.subheader("Daily NDVI Data")
+            if 'ndvi_daily_data' in st.session_state and len(st.session_state['ndvi_daily_data']) > 0:
+                # Format the data in a download-friendly way
+                daily_data_df = pd.DataFrame({
+                    'date': list(st.session_state['ndvi_daily_data'].keys()),
+                    'mean_ndvi': [data['mean'] for data in st.session_state['ndvi_daily_data'].values()]
+                })
+                
+                # Sort by date
+                daily_data_df['date'] = pd.to_datetime(daily_data_df['date'])
+                daily_data_df = daily_data_df.sort_values('date')
+                
+                # Display as a table
+                st.dataframe(daily_data_df.style.format({'mean_ndvi': '{:.4f}'}))
+                
+                # Convert date back to string for CSV export
+                daily_data_df['date'] = daily_data_df['date'].dt.strftime('%Y-%m-%d')
+                
+                # Download buttons
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Download time series data
+                    csv = ndvi_time_series.to_csv(index=False)
+                    st.download_button(
+                        label="Download Time Series Data",
+                        data=csv,
+                        file_name="ndvi_time_series.csv",
+                        mime="text/csv",
+                    )
+                
+                with col2:
+                    # Download button for daily NDVI data
+                    csv_daily = daily_data_df.to_csv(index=False)
+                    st.download_button(
+                        label="Download Daily NDVI Data",
+                        data=csv_daily,
+                        file_name="ndvi_daily_data.csv",
+                        mime="text/csv",
+                    )
+            else:
+                st.warning("Daily NDVI data not available. Run the analysis to generate this data.")
+                
+                # Download time series data only
+                csv = ndvi_time_series.to_csv(index=False)
+                st.download_button(
+                    label="Download Time Series Data",
+                    data=csv,
+                    file_name="ndvi_time_series.csv",
+                    mime="text/csv",
+                )
+        else:
+            st.warning("Insufficient satellite data available for time series analysis. Try extending the date range.")
+    with tab4:
+        st.subheader("Rainfall Analysis")
+        
+        if rainfall_data is not None and len(rainfall_data['time_series']) > 0:
+            rainfall_ts = rainfall_data['time_series']
+            # Convert dates to datetime objects for better plotting
+            rainfall_ts['date'] = pd.to_datetime(rainfall_ts['date'])
+            
+            # Create Plotly figure for rainfall
+            fig_rain = px.bar(
+                rainfall_ts, 
+                x='date', 
+                y='rainfall',
+                title=f'Daily Rainfall for Field Area',
+                labels={'date': 'Date', 'rainfall': 'Rainfall (mm)'},
+                color='rainfall',
+                color_continuous_scale='Blues'
+            )
+            
+            # Improve layout
+            fig_rain.update_layout(
+                xaxis_title="Date",
+                yaxis_title="Rainfall (mm)",
+                hovermode="x unified"
+            )
+            
+            # Display the plot
+            st.plotly_chart(fig_rain, use_container_width=True)
+            
+            # Calculate rainfall statistics
+            total_rainfall = rainfall_ts['rainfall'].sum()
+            avg_daily_rainfall = rainfall_ts['rainfall'].mean()
+            max_daily_rainfall = rainfall_ts['rainfall'].max()
+            
+            # Create columns for statistics
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Rainfall", f"{total_rainfall:.1f} mm")
+            col2.metric("Avg. Daily Rainfall", f"{avg_daily_rainfall:.2f} mm")
+            col3.metric("Max Daily Rainfall", f"{max_daily_rainfall:.1f} mm")
+            
+            # Rainfall assessment for the crop
+            st.subheader("Rainfall Assessment")
+            
+            # Get optimal rainfall for crop
+            optimal_rainfall = get_optimal_rainfall(crop_type)
+            
+            # Calculate period days from the time series data
+            first_date = rainfall_ts['date'].min()
+            last_date = rainfall_ts['date'].max()
+            period_days = (last_date - first_date).days + 1
+            
+            # Scale optimal rainfall to the period length
+            scaled_optimal = optimal_rainfall * period_days / 30  # Assuming optimal is per month
+            
+            if total_rainfall < scaled_optimal * 0.7:
+                st.warning(f"The total rainfall ({total_rainfall:.1f} mm) is below the optimal range for {crop_type}. Consider irrigation if available.")
+            elif total_rainfall > scaled_optimal * 1.3:
+                st.warning(f"The total rainfall ({total_rainfall:.1f} mm) is above the optimal range for {crop_type}. Monitor for disease pressure and potential nutrient leaching.")
+            else:
+                st.success(f"The total rainfall ({total_rainfall:.1f} mm) is within an acceptable range for {crop_type}.")
+            
+            # Download rainfall data
+            csv = rainfall_ts.to_csv(index=False)
             st.download_button(
-                label="Download Time Series Data",
+                label="Download Rainfall Data",
                 data=csv,
-                file_name="ndvi_time_series.csv",
+                file_name="rainfall_data.csv",
                 mime="text/csv",
             )
         else:
-            st.warning("Insufficient satellite data available for time series analysis. Try extending the date range.")
+            st.warning("Insufficient rainfall data available for the selected period.")
     
-    with tab4:
+    with tab5:
         st.subheader("Statistical Analysis")
         
         # Get NDVI statistics for the field
@@ -469,15 +824,86 @@ def display_results(ndvi_image, zoned_image, geometry, lat, lon, clustering_meth
                 except:
                     pass
             
-            # Create recommendations based on NDVI values and crop type
+            # Create recommendations based on NDVI values, crop type, and rainfall
             st.subheader("Recommendations")
-            recommendations = generate_recommendations(mean_ndvi, zones_param if isinstance(zones_param, int) else num_zones, crop_type)
+            recommendations = generate_recommendations(mean_ndvi, zones_param if isinstance(zones_param, int) else num_zones, crop_type, rainfall_data)
             for rec in recommendations:
                 st.markdown(f"- {rec}")
                 
         except Exception as e:
             st.error(f"Error computing statistics: {str(e)}")
+    
+    with tab6:
+        st.subheader("Clustering Algorithm Comparison")
+        
+        # If we're comparing all algorithms, run all of them
+        if performance_metrics is None or len(performance_metrics) < 3:
+            st.write("For a full comparison, run each algorithm separately or use the 'Compare All' option.")
+            
+            # Create a comparison table with known advantages/disadvantages
+            # Update the comparison_df in tab6
+            comparison_df = pd.DataFrame({
+                "Algorithm": ["K-Means", "DBSCAN", "Mean Shift", "GMM"],
+                "Strengths": [
+                    "Simple, fast, works well with spherical clusters",
+                    "No need to specify number of clusters, handles irregular shapes, identifies outliers",
+                    "Automatically determines clusters, handles non-spherical shapes, robust to outliers",
+                    "Probabilistic approach, handles overlapping clusters, more flexible than K-Means"
+                ],
+                "Limitations": [
+                    "Requires number of clusters in advance, sensitive to initialization, assumes spherical clusters",
+                    "Sensitive to parameters (eps, min_samples), performance issues with large datasets",
+                    "Computationally intensive, sensitive to bandwidth parameter, may be slow for large datasets",
+                    "More computational overhead, still requires number of components, can overfit with small datasets"
+                ],
+                "Best for": [
+                    "Simple, well-separated field zones with similar sizes",
+                    "Fields with irregular patterns and potential outliers",
+                    "Fields with natural clusters of varying sizes and densities",
+                    "Fields with gradual transitions between zones and overlapping characteristics"
+                ]
+            })
+            
+            st.table(comparison_df)
+            
+            if performance_metrics and len(performance_metrics) > 0:
+                st.subheader("Current Run Performance")
+                perf_df = pd.DataFrame({
+                    "Algorithm": list(performance_metrics.keys()),
+                    "Processing Time (seconds)": list(performance_metrics.values())
+                })
+                st.table(perf_df)
+        
+        st.write("""
+        **Choosing the Best Algorithm:**
+        
+        1. **K-Means** is recommended for fields with clear, distinct zones and when processing time is a concern.
+        
+        2. **DBSCAN** works best when field conditions have irregular patterns or outliers, and the number of management zones is not known in advance.
+        
+        3. **GMM** is ideal for fields with gradual transitions between zones and when probabilistic cluster assignment is beneficial.
+        
+        For most agricultural applications, K-Means provides a good balance of performance and interpretability.
+        """)
+        
+        if clustering_method == "GMM":
+            st.info("GMM (Gaussian Mixture Model) creates zones based on probability distributions, which can better capture the natural variation in field conditions compared to hard boundaries.")
+        if clustering_method == "Mean Shift":
+            st.info("Mean Shift clustering is useful for identifying clusters of varying shapes and sizes, but it can be computationally intensive.")
 
+def get_optimal_rainfall(crop_type):
+    """Return optimal monthly rainfall (mm) for different crops."""
+    # These are approximate monthly values during growing season
+    rainfall_requirements = {
+        "Wheat": 80,  # 80-100 mm/month
+        "Corn/Maize": 120,  # 120-140 mm/month
+        "Rice": 180,  # Depends on irrigation method
+        "Soybeans": 100,  # 100-120 mm/month
+        "Cotton": 70,  # 70-100 mm/month
+        "Sugarcane": 150,  # 150-200 mm/month
+        "Other": 100,  # Generic value
+    }
+    return rainfall_requirements.get(crop_type, 100)
 def get_crop_ndvi_range(crop_type):
     """Return typical NDVI range for different crops at peak growth."""
     crop_ranges = {
@@ -564,7 +990,7 @@ def generate_recommendations(mean_ndvi, num_zones, crop_type):
     
     return recommendations
 
-def generate_report(lat, lon, buffer, start_date, end_date, clustering_method, zones_param, crop_type, crop_stage):
+def generate_report(lat, lon, buffer, start_date, end_date, clustering_method, zones_param, crop_type, crop_stage, rainfall_data=None):
     """Generate a detailed text report for download."""
     report = f"""
 Field Analysis Report
@@ -580,14 +1006,31 @@ Crop Information:
 - Crop Type: {crop_type}
 - Growth Stage: {crop_stage}
 - Typical NDVI Range for {crop_type}: {get_crop_ndvi_range(crop_type)}
+- Optimal Monthly Rainfall for {crop_type}: {get_optimal_rainfall(crop_type)} mm
 
 Analysis Parameters:
 - Analysis Period: {start_date} to {end_date}
 - Clustering Method: {clustering_method}
 - Zone Parameters: {zones_param}
-
+"""
+    
+    # Add rainfall summary if available
+    if rainfall_data is not None and len(rainfall_data['time_series']) > 0:
+        rainfall_ts = rainfall_data['time_series']
+        total_rainfall = rainfall_ts['rainfall'].sum()
+        avg_daily = rainfall_ts['rainfall'].mean()
+        max_daily = rainfall_ts['rainfall'].max()
+        
+        report += f"""
+Rainfall Summary:
+- Total Rainfall: {total_rainfall:.1f} mm
+- Average Daily Rainfall: {avg_daily:.2f} mm
+- Maximum Daily Rainfall: {max_daily:.1f} mm
+"""
+    
+    report += """
 Summary of Results:
-- The field was segmented using {clustering_method} clustering.
+- The field was segmented using clustering to identify management zones.
 - Zones represent different levels of crop vigor, from lowest to highest.
 - Consider variable rate application of inputs based on these zones.
 
@@ -596,6 +1039,7 @@ Management Recommendations:
 2. Take soil samples from each management zone
 3. Develop variable rate prescription maps for inputs
 4. Monitor changes in NDVI over time to assess management effectiveness
+5. Adjust irrigation scheduling based on rainfall patterns
 
 For more detailed analysis, please consider:
 - Soil testing in each zone
